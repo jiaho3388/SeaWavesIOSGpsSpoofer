@@ -7,6 +7,7 @@ import json
 import re
 import threading
 import math
+import urllib.request
 import tkinter as tk
 from tkinter import messagebox, font, ttk, filedialog
 
@@ -18,15 +19,12 @@ logging.basicConfig(level=logging.INFO)
 device_connected = False
 current_location_process = None
 
-# ✨ Tunneld 專用全域變數
 tunnel_process = None
 tunnel_active = False
 
-# ✨ 多設備切換專用變數
 connected_devices = [] 
 current_udid = None    
 
-# UI 相關全域變數
 longitude_entry = None
 latitude_entry = None
 target_lon_entry = None
@@ -37,9 +35,9 @@ live_lat_label = None
 live_lon_label = None
 connection_status_label = None
 tunnel_status_label = None 
+engine_status_label = None 
 device_dropdown = None 
 
-# JoyStick 專用全域變數
 joystick_dx = 0
 joystick_dy = 0
 is_joystick_moving = False
@@ -48,6 +46,168 @@ is_joystick_moving = False
 # ========================= [核心功能與引擎] ===============================
 # ==============================================================================
 
+def get_rsd_info(udid):
+    """向 tunneld 請求 RSD 通訊埠 (支援最新 tunnel-address 陣列格式與舊版格式)"""
+    try:
+        req = urllib.request.Request("http://127.0.0.1:49151/")
+        with urllib.request.urlopen(req) as resp:
+            raw_data = resp.read().decode('utf-8')
+            # 已經抓到蟲了，可以把 DEBUG 註解掉，保持終端機乾淨
+            # logging.info(f"🕵️‍♂️ [DEBUG] Tunneld 原始回傳: {raw_data}") 
+            
+            data = json.loads(raw_data)
+            
+            # 方案 A: 新版格式 {"UDID": [{"tunnel-address": "...", "tunnel-port": ...}]}
+            if isinstance(data, dict):
+                for key, val in data.items():
+                    # 只要包含你的 UDID 前綴 (00008110) 就命中
+                    if udid in key:
+                        # 情況 1: 值是列表 (最新版)
+                        if isinstance(val, list) and len(val) > 0:
+                            target = val[0]
+                            host = target.get("tunnel-address") or target.get("rsd_address")
+                            port = target.get("tunnel-port") or target.get("rsd_port")
+                            return host, port
+                        # 情況 2: 值是字典 (中期版本)
+                        elif isinstance(val, dict):
+                            host = val.get("tunnel-address") or val.get("rsd_address")
+                            port = val.get("tunnel-port") or val.get("rsd_port")
+                            return host, port
+                            
+            # 方案 B: 舊版格式 (List)
+            elif isinstance(data, list):
+                for d in data:
+                    if isinstance(d, dict) and (d.get("Identifier") == udid or d.get("udid") == udid):
+                        host = d.get("tunnel-address") or d.get("rsd_address")
+                        port = d.get("tunnel-port") or d.get("rsd_port")
+                        return host, port
+                        
+    except Exception as e:
+        logging.error(f"無法取得 RSD 資訊: {e}")
+    return None, None
+
+class ContinuousLocationEngine(threading.Thread):
+    def __init__(self, udid, ios_major_version):
+        super().__init__()
+        self.udid = udid
+        self.ios_major_version = ios_major_version
+        self.running = True
+        self.target_lat = None
+        self.target_lon = None
+        self.daemon = True
+        
+    def update_target(self, lat, lon):
+        self.target_lat = lat
+        self.target_lon = lon
+
+    def get_dvt_service(self):
+        try:
+            from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider as DvtService
+            return DvtService
+        except ImportError:
+            try:
+                from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import DvtSecureSocketProxyService as DvtService
+                return DvtService
+            except ImportError:
+                raise ImportError("底層模組解析失敗，無法找到 DvtProvider！")
+
+    def run(self):
+        logging.info(f"🚀 啟動 Pure Python 底層引擎 (UDID: {self.udid[:8]} | iOS {self.ios_major_version})")
+        if self.ios_major_version < 17:
+            self.run_sync()
+        else:
+            import asyncio
+            asyncio.run(self.run_async())
+
+    def run_sync(self):
+        try:
+            DvtService = self.get_dvt_service()
+            from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
+            from pymobiledevice3.lockdown import create_using_usbmux
+            
+            lockdown = create_using_usbmux(serial=self.udid)
+            with DvtService(lockdown=lockdown) as dvt:
+                import asyncio
+                asyncio.run(self._simulation_loop_async(dvt, LocationSimulation))
+        except Exception as e:
+            logging.error(f"🚨 Pure Python 引擎 (Sync) 崩潰: {e}")
+
+    async def run_async(self):
+        try:
+            DvtService = self.get_dvt_service()
+            from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
+            from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
+            
+            host, port = get_rsd_info(self.udid)
+            if not host or not port:
+                logging.error("❌ 無法取得 RSD 資訊，請確認 tunneld 是否啟動。")
+                return
+            
+            async with RemoteServiceDiscoveryService((host, port)) as rsd:
+                is_dvt_async = hasattr(DvtService, '__aenter__')
+                
+                if is_dvt_async:
+                    async with DvtService(lockdown=rsd) as dvt:
+                        await self._simulation_loop_async(dvt, LocationSimulation)
+                else:
+                    with DvtService(lockdown=rsd) as dvt:
+                        await self._simulation_loop_async(dvt, LocationSimulation)
+                        
+        except Exception as e:
+            logging.error(f"🚨 Pure Python 引擎 (Async) 崩潰: {e}")
+
+    # 🎯 [終極改寫] 完美接住 LocationSimulation 的 async with 要求
+    async def _simulation_loop_async(self, dvt, LocationSimulation):
+        import inspect
+        import asyncio
+        loc_sim = LocationSimulation(dvt)
+
+        # 把核心發射邏輯包裝起來，等連線建立後再呼叫
+        async def _core_loop():
+            last_lat, last_lon = None, None
+            sim_func = getattr(loc_sim, "set", getattr(loc_sim, "simulate_location", None))
+            if not sim_func:
+                logging.error("🚨 找不到座標發射函數！")
+                return
+                
+            is_async_func = inspect.iscoroutinefunction(sim_func)
+            logging.info(f"✅ DVT 專屬通道建立成功！(使用發射器: {sim_func.__name__}) 🚀 開始 0.1s 極速連發")
+            
+            while self.running:
+                if self.target_lat is not None and self.target_lon is not None:
+                    if (self.target_lat, self.target_lon) != (last_lat, last_lon):
+                        try:
+                            if is_async_func:
+                                await sim_func(self.target_lat, self.target_lon)
+                            else:
+                                sim_func(self.target_lat, self.target_lon)
+                            last_lat, last_lon = self.target_lat, self.target_lon
+                        except Exception as e:
+                            logging.error(f"管道斷開: {e}")
+                            break
+                await asyncio.sleep(0.1)
+
+        # 🛡️ 動態適應: 檢查發射器是否需要 async with 開啟
+        if hasattr(loc_sim, '__aenter__'):
+            async with loc_sim:
+                await _core_loop()
+        elif hasattr(loc_sim, '__enter__'):
+            with loc_sim:
+                await _core_loop()
+        else:
+            # 如果它要求 await connect() 的備用方案
+            if hasattr(loc_sim, 'connect'):
+                if inspect.iscoroutinefunction(loc_sim.connect):
+                    await loc_sim.connect()
+                else:
+                    loc_sim.connect()
+            await _core_loop()
+            
+    def stop(self):
+        self.running = False
+        
+pure_engine = None
+
 def start_tunneld_engine():
     global tunnel_process, tunnel_active
     if tunnel_process is not None:
@@ -55,10 +215,8 @@ def start_tunneld_engine():
 
     creationflags = 0
     if sys.platform == "win32":
-        creationflags = 0x08000000 # CREATE_NO_WINDOW
-
+        creationflags = 0x08000000 
         try:
-            logging.info("🧹 Cleaning up existing zombie tunneld processes...")
             subprocess.run(["taskkill", "/F", "/IM", "pymobiledevice3.exe", "/T"], 
                            stdout=subprocess.DEVNULL, 
                            stderr=subprocess.DEVNULL, 
@@ -76,9 +234,7 @@ def start_tunneld_engine():
             creationflags=creationflags
         )
         tunnel_active = True
-        logging.info("🌐 Tunneld background engine started successfully.")
     except Exception as e:
-        logging.error(f"🚨 Failed to start tunneld: {e}")
         tunnel_active = False
 
 def strip_ansi_codes(text):
@@ -116,7 +272,6 @@ def monitor_device_connection():
             if tunnel_process.poll() is not None:
                 tunnel_active = False
                 tunnel_process = None
-                logging.warning("Tunneld process terminated unexpectedly.")
 
         time.sleep(3)
 
@@ -202,63 +357,45 @@ def validate_coordinates(longitude, latitude):
         return True
     return False
 
+def get_safe_ios_version(udid):
+    ios_version_str = "16.0"
+    for d in connected_devices:
+        if d["udid"] == udid:
+            ios_version_str = d["version"]
+            break
+    match = re.search(r'^(\d+)', str(ios_version_str))
+    return int(match.group(1)) if match else 16
+
 def update_location_bg(latitude, longitude):
-    global current_location_process, current_udid
+    global current_udid, pure_engine, engine_status_label
     
     if not current_udid:
-        logging.warning("尚未選擇任何設備，無法發送座標。")
         return
 
-    # 🧹 [暴力且安全的清理法]：不再使用 PIPE 通道，直接終止舊進程
-    if current_location_process is not None:
-        try:
-            current_location_process.terminate() # 優雅請求終止
-            current_location_process.wait(timeout=0.5)
-        except:
-            try:
-                current_location_process.kill()  # 不聽話就直接拔管
-            except:
-                pass
+    ios_major_version = get_safe_ios_version(current_udid)
 
-    command = [
-        "pymobiledevice3", "developer", "dvt", "simulate-location", "set",
-        "--udid", current_udid, 
-        "--", str(latitude), str(longitude)
-    ]
-    
-    try:
-        creationflags = 0x08000000 if sys.platform == "win32" else 0
-        current_location_process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,  # 👈 核心修復：不開通道，徹底根除 Errno 22
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags
-        )
-    except Exception as e:
-        logging.error(f"🚨 發送定位進程啟動失敗: {e}")
+    # ✨ 完美達成 C計畫：全設備統一使用 Pure Python 高頻專線
+    if engine_status_label:
+        engine_status_label.config(text="⚙️ 引擎: Pure Python (極速 0.1s)", fg='#4fc1ff')
 
-# ==============================================================================
+    if pure_engine is None or pure_engine.udid != current_udid or not pure_engine.is_alive():
+        if pure_engine:
+            pure_engine.stop()
+        pure_engine = ContinuousLocationEngine(current_udid, ios_major_version)
+        pure_engine.start()
+        
+    pure_engine.update_target(latitude, longitude)
 
 def safe_exit():
-    global current_location_process, tunnel_process
-    logging.info("Initiating safe exit sequence...")
-    
-    # 關閉定位發射器
-    if current_location_process is not None:
-        try:
-            current_location_process.terminate()
-        except:
-            pass
-            
-    # 關閉 Tunneld 引擎
+    global tunnel_process, pure_engine
+    if pure_engine:
+        pure_engine.stop()
     if tunnel_process is not None:
         try:
             tunnel_process.terminate()
             tunnel_process.wait(timeout=2)
         except:
             tunnel_process.kill()
-            
     sys.exit(0)
     
 def get_distance(lat1, lon1, lat2, lon2):
@@ -273,9 +410,7 @@ def get_distance(lat1, lon1, lat2, lon2):
     return R * c
 
 def set_location():
-    global longitude_entry, latitude_entry, live_lat_label, live_lon_label
-    global current_udid, connected_devices
-    
+    global longitude_entry, latitude_entry, live_lat_label, live_lon_label, current_udid
     if not current_udid:
         messagebox.showerror("Error", "請先從上方選單選擇一台目標手機！")
         return
@@ -288,16 +423,10 @@ def set_location():
             messagebox.showerror("Error", "Invalid longitude or latitude range.")
             return
 
-        ios_version = "16.0"
-        for d in connected_devices:
-            if d["udid"] == current_udid:
-                ios_version = d["version"]
-                break
-
-        ios_major_version = int(ios_version.split('.')[0])
+        ios_major_version = get_safe_ios_version(current_udid)
         if ios_major_version < 17:
             if not mount_developer_disk_image():
-                messagebox.showerror("Error", "Failed to mount the Developer Disk Image.")
+                messagebox.showerror("Error", "Failed to mount Developer Disk Image.")
                 return
 
         update_location_bg(latitude, longitude)
@@ -307,10 +436,8 @@ def set_location():
             live_lon_label.config(text=f"經度 (Lon): {longitude:.6f}")
         
         messagebox.showinfo("Success", "Location set successfully!")
-
     except ValueError:
         messagebox.showerror("Error", "Invalid input for longitude or latitude.")
-
 
 # ==============================================================================
 # ========================= [Rei's Pro Dark Edition UI] ========================
@@ -327,14 +454,14 @@ def main():
 
     global longitude_entry, latitude_entry, target_lon_entry, target_lat_entry, speed_entry
     global live_lat_label, live_lon_label, info_label
-    global connection_status_label, tunnel_status_label, device_dropdown
+    global connection_status_label, tunnel_status_label, engine_status_label, device_dropdown
     global joystick_dx, joystick_dy, is_joystick_moving
 
     start_tunneld_engine()
     threading.Thread(target=monitor_device_connection, daemon=True).start()
 
     root = tk.Tk()
-    root.title("Rei's iOS Location Simulator Pro")
+    root.title("Rei's iOS Location Simulator Pro v2.0.2")
     root.protocol("WM_DELETE_WINDOW", safe_exit)
     
     ui_font_family = "Microsoft JhengHei UI"
@@ -346,7 +473,6 @@ def main():
 
     root.configure(bg=main_bg_color)
     
-    # ✨ 套用你專屬的視窗大小與位置 (X=50, 靠左顯示)
     window_width = 500
     window_height = 800
     screen_height = root.winfo_screenheight()
@@ -384,42 +510,39 @@ def main():
 
     main_frame.config(padx=15, pady=10)
 
-    # ==================== [UI 元件建立] ====================
     tk.Label(main_frame, text="Rei's iOS Location Simulator", font=title_font, bg=main_bg_color, fg=accent_color).pack(pady=(0, 15))
 
-    # [區塊 1：雙引擎狀態與設備選擇]
     status_container = tk.Frame(main_frame, bg=main_bg_color)
     status_container.pack(pady=5)
     
-    # 這裡的文字會透過後面的 update 函數動態顯示「鎖定目標」
     connection_status_label = tk.Label(status_container, text="🔍 尋找設備中...", font=label_font, bg=main_bg_color, fg=warning_color)
     connection_status_label.grid(row=0, column=0, padx=10)
     
     tunnel_status_label = tk.Label(status_container, text="🌐 Tunnel: 啟動中...", font=label_font, bg=main_bg_color, fg=text_color)
     tunnel_status_label.grid(row=0, column=1, padx=10)
 
-    tk.Label(status_container, text="選擇目標設備:", font=label_font, bg=main_bg_color, fg=text_color).grid(row=1, column=0, pady=(10,0), sticky="e")
+    engine_status_label = tk.Label(status_container, text="⚙️ 引擎: 待命中", font=label_font, bg=main_bg_color, fg=text_color)
+    engine_status_label.grid(row=1, column=0, columnspan=2, pady=(5,0))
+
+    tk.Label(status_container, text="選擇目標設備:", font=label_font, bg=main_bg_color, fg=text_color).grid(row=2, column=0, pady=(10,0), sticky="e")
     device_var = tk.StringVar()
     device_dropdown = ttk.Combobox(status_container, textvariable=device_var, state="readonly", font=label_font, width=22)
-    device_dropdown.grid(row=1, column=1, pady=(10,0), sticky="w")
+    device_dropdown.grid(row=2, column=1, pady=(10,0), sticky="w")
 
-    # ✨ [嚴謹化]：切換設備時的明確回饋機制
     def on_device_selected(event):
         global current_udid
         idx = device_dropdown.current()
         if idx >= 0 and idx < len(connected_devices):
             current_udid = connected_devices[idx]["udid"]
             dev_name = connected_devices[idx]["name"]
-            logging.info(f"Target switched to UDID: {current_udid}")
-            # 彈出視窗給予最強烈的「切換成功」確認感
-            messagebox.showinfo("設備切換成功", f"定位發射引擎已重新鎖定目標：\n\n🎯 {dev_name}")
+            ios_ver = connected_devices[idx]["version"]
+            messagebox.showinfo("鎖定目標", f"目標切換至：\n🎯 {dev_name}\n📱 系統版本: iOS {ios_ver}")
             
     device_dropdown.bind("<<ComboboxSelected>>", on_device_selected)
 
     def update_status_labels():
         global device_connected, tunnel_active, connected_devices, current_udid
         
-        # 1. 動態更新下拉選單
         current_vals = list(device_dropdown['values'])
         new_vals = [d['name'] for d in connected_devices]
         
@@ -433,19 +556,18 @@ def main():
                 device_dropdown.set('沒有偵測到 iOS 設備')
                 current_udid = None
 
-        # 2. ✨ [嚴謹化]：讓指示燈精準反映「當前鎖定的目標是誰」
         if device_connected and current_udid:
-            # 找出當前 UDID 對應的名稱
             current_target_name = "未知設備"
+            current_ios_ver = "未知"
             for d in connected_devices:
                 if d["udid"] == current_udid:
                     current_target_name = d["name"]
+                    current_ios_ver = d["version"]
                     break
-            connection_status_label.config(text=f"🎯 目標: {current_target_name}", fg=success_color)
+            connection_status_label.config(text=f"🎯 目標: {current_target_name} (iOS {current_ios_ver})", fg=success_color)
         else:
             connection_status_label.config(text="❌ 尚未鎖定任何設備", fg=warning_color)
             
-        # 3. 更新 Tunnel 狀態
         if tunnel_active:
             tunnel_status_label.config(text="🌐 Tunnel: 運作中", fg=success_color)
         else:
@@ -471,10 +593,10 @@ def main():
     data_ops_frame = tk.Frame(file_ops_frame, bg=main_bg_color)
     data_ops_frame.pack(side="top", fill="x")
 
-    save_as_button = tk.Button(data_ops_frame, text="Save As (儲存座標)", font=modern_font, bg=secondary_color, fg=text_color, borderwidth=0, padx=10, pady=5, command=save_as)
+    save_as_button = tk.Button(data_ops_frame, text="Save As", font=modern_font, bg=secondary_color, fg=text_color, borderwidth=0, padx=10, pady=5, command=save_as)
     save_as_button.pack(side="left", expand=True, padx=(0, 5))
 
-    load_button = tk.Button(data_ops_frame, text="Load (讀取座標)", font=modern_font, bg=secondary_color, fg=text_color, borderwidth=0, padx=10, pady=5, command=load)
+    load_button = tk.Button(data_ops_frame, text="Load", font=modern_font, bg=secondary_color, fg=text_color, borderwidth=0, padx=10, pady=5, command=load)
     load_button.pack(side="right", expand=True, padx=(5, 0))
 
     coord_frame = tk.LabelFrame(main_frame, text="📍 座標設定 (Coordinate)", bg=main_bg_color, fg=text_color, font=header_font)
@@ -492,7 +614,6 @@ def main():
     set_location_button = tk.Button(coord_frame, text="Set Location (單點降落)", font=modern_font, bg=accent_color, fg=text_color, borderwidth=0, padx=10, pady=5, command=set_location)
     set_location_button.grid(row=2, column=0, columnspan=2, pady=(15, 0), sticky="ew")
 
-    # ==================== [區塊 4：🚶‍♂️ 折疊式 自動導航] ====================
     nav_container = tk.Frame(main_frame, bg=main_bg_color)
     nav_container.pack(fill="x", pady=10)
 
@@ -510,15 +631,15 @@ def main():
     nav_content = tk.Frame(nav_container, bg=frame_bg_color, padx=10, pady=10)
     nav_content.pack(fill="x")
 
-    tk.Label(nav_content, text="Target Longitude (目標經度):", font=label_font, bg=frame_bg_color, fg=text_color).grid(row=0, column=0, sticky="e", pady=5)
+    tk.Label(nav_content, text="Target Long:", font=label_font, bg=frame_bg_color, fg=text_color).grid(row=0, column=0, sticky="e", pady=5)
     target_lon_entry = tk.Entry(nav_content, font=modern_font, bg='#3c3c3c', fg=text_color, insertbackground=text_color, width=18)
     target_lon_entry.grid(row=0, column=1, padx=10, pady=5)
 
-    tk.Label(nav_content, text="Target Latitude (目標緯度):", font=label_font, bg=frame_bg_color, fg=text_color).grid(row=1, column=0, sticky="e", pady=5)
+    tk.Label(nav_content, text="Target Lat:", font=label_font, bg=frame_bg_color, fg=text_color).grid(row=1, column=0, sticky="e", pady=5)
     target_lat_entry = tk.Entry(nav_content, font=modern_font, bg='#3c3c3c', fg=text_color, insertbackground=text_color, width=18)
     target_lat_entry.grid(row=1, column=1, padx=10, pady=5)
 
-    tk.Label(nav_content, text="Speed (時速 km/h):", font=label_font, bg=frame_bg_color, fg=text_color).grid(row=2, column=0, sticky="e", pady=5)
+    tk.Label(nav_content, text="Speed (km/h):", font=label_font, bg=frame_bg_color, fg=text_color).grid(row=2, column=0, sticky="e", pady=5)
     speed_entry = tk.Entry(nav_content, font=modern_font, bg='#3c3c3c', fg=text_color, insertbackground=text_color, width=18)
     speed_entry.insert(0, "15") 
     speed_entry.grid(row=2, column=1, padx=10, pady=5)
@@ -536,7 +657,7 @@ def main():
                 dist_km = dist_m / 1000
                 time_hours = dist_km / speed_kmh
                 time_mins = time_hours * 60
-                info_label.config(text=f"距離: {dist_km:.2f} km | 預估時間: {time_mins:.1f} 分鐘", fg=text_color, bg=frame_bg_color)
+                info_label.config(text=f"距離: {dist_km:.2f} km | 預估: {time_mins:.1f} 分鐘", fg=text_color, bg=frame_bg_color)
         except ValueError:
             pass
 
@@ -549,9 +670,8 @@ def main():
     def start_custom_walk():
         global current_udid
         if not current_udid:
-            messagebox.showerror("Error", "請先選擇一台設備！")
+            messagebox.showerror("Error", "請先選擇設備！")
             return
-            
         try:
             start_lat = float(latitude_entry.get())
             start_lon = float(longitude_entry.get())
@@ -559,14 +679,14 @@ def main():
             end_lon = float(target_lon_entry.get())
             speed_kmh = float(speed_entry.get())
 
-            if speed_kmh <= 0:
-                messagebox.showwarning("Warning", "Speed must be greater than 0.")
-                return
+            if speed_kmh <= 0: return
 
             dist_m = get_distance(start_lat, start_lon, end_lat, end_lon)
             speed_ms = speed_kmh * (1000 / 3600) 
             total_time_s = dist_m / speed_ms
-            delay = 3 
+            
+            # ✨ 導航模式間隔
+            delay = 0.5 
             steps = max(1, int(total_time_s / delay))
 
             def walk_loop():
@@ -591,27 +711,24 @@ def main():
                     progress_percent = (elapsed_km / dist_km * 100) if dist_km > 0 else 100
                     
                     elapsed_seconds = int(time.time() - start_time)
-                    status_text = f"導航中... 進度: {progress_percent:.1f}% | 經過時間: {elapsed_seconds//60:02d}:{elapsed_seconds%60:02d}"
+                    status_text = f"導航中: {progress_percent:.1f}% | {elapsed_seconds//60:02d}:{elapsed_seconds%60:02d}"
                     info_label.config(text=status_text, fg=text_color, bg=frame_bg_color)
-                    
                     time.sleep(delay)
                     
                 info_label.config(text="狀態: 已抵達終點！", fg=success_color, bg=frame_bg_color)
                 start_walking_button.config(state="normal")
 
             threading.Thread(target=walk_loop, daemon=True).start()
-
         except ValueError:
-            messagebox.showerror("Error", "Please enter valid numbers.")
+            messagebox.showerror("Error", "輸入無效。")
 
     start_walking_button = tk.Button(nav_content, text="Start Walking (開始導航)", font=modern_font, bg=accent_color, fg=text_color, borderwidth=0, padx=10, pady=5, command=start_custom_walk)
     start_walking_button.grid(row=4, column=0, columnspan=2, pady=(15, 0), sticky="ew")
 
-    info_label = tk.Label(nav_content, text="請輸入目標與速度以計算預估時間", font=label_font, bg=frame_bg_color, fg=text_color)
+    info_label = tk.Label(nav_content, text="輸入目標計算時間", font=label_font, bg=frame_bg_color, fg=text_color)
     info_label.grid(row=3, column=0, columnspan=2, pady=5)
 
 
-    # ==================== [區塊 5：🎮 折疊式 虛擬搖桿] ====================
     joystick_container = tk.Frame(main_frame, bg=main_bg_color)
     joystick_container.pack(fill="x", pady=10)
 
@@ -667,12 +784,14 @@ def main():
 
     def joystick_engine():
         global joystick_dx, joystick_dy, is_joystick_moving, current_udid
-        delay = 3             
         max_speed_kmh = 15.0  
 
         while True:
             if is_joystick_moving and (joystick_dx != 0 or joystick_dy != 0) and current_udid:
                 try:
+                    # ✨ 搖桿模式：直接寫死 0.1s 電競級反應
+                    delay = 0.1 
+
                     current_lat = float(latitude_entry.get())
                     current_lon = float(longitude_entry.get())
 
@@ -708,7 +827,6 @@ def main():
 
     threading.Thread(target=joystick_engine, daemon=True).start()
 
-    # [最後區塊：系統操作]
     exit_button = tk.Button(main_frame, text="Exit (安全離開模擬器)", font=modern_font, bg=warning_color, fg=text_color, borderwidth=0, padx=10, pady=10, command=safe_exit)
     exit_button.pack(side="top", fill="x", pady=10)
 
