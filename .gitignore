@@ -1,0 +1,21 @@
+# Python 暫存檔
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虛擬環境
+.venv/
+venv/
+ENV/
+env/
+
+# VS Code 設定
+.vscode/
+
+# PyInstaller 打包產物 (避免未來打包時弄髒 Git)
+build/
+dist/
+*.spec
+
+# 個人資料與座標快取 (重要防護！)
+*.txt
