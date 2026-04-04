@@ -97,7 +97,7 @@ class ContinuousLocationEngine(threading.Thread):
             return DvtService
         except ImportError:
             try:
-                from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import DvtSecureSocketProxyService as DvtService
+                from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import DvtSecureSocketProxyService as DvtService # type: ignore
                 return DvtService
             except ImportError:
                 raise ImportError("底層模組解析失敗，無法找到 DvtProvider！")
