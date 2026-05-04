@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>SeaWaves Fleet Command (Web Edition)</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        body { 
+            margin: 0; 
+            padding: 0; 
+            background-color: #121212; 
+            color: #00ff00; 
+            font-family: 'Consolas', monospace; 
+        }
+        /* 讓地圖填滿整個畫面 */
+        #map { 
+            height: 100vh; 
+            width: 100vw; 
+            cursor: crosshair; /* 游標改成準星模式 */
+        }
+        /* 左上角戰術UI浮水印 */
+        #overlay {
+            position: absolute;
+            top: 20px;
+            left: 50px;
+            z-index: 1000;
+            background: rgba(18, 18, 18, 0.8);
+            padding: 15px;
+            border-left: 3px solid #ff4fc1;
+            pointer-events: none;
+        }
+        /* 戰術控制面板 */
+        #control-panel {
+            position: absolute;
+            bottom: 30px;
+            left: 50px;
+            z-index: 1000;
+            background: rgba(30, 30, 30, 0.9);
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+        input {
+            background: #121212; color: #fff; border: 1px solid #555;
+            padding: 8px; margin: 5px 0; width: 150px; font-family: 'Consolas', monospace;
+        }
+        button {
+            background: #0a84ff; color: white; border: none; font-weight: bold;
+            padding: 10px 15px; margin-top: 10px; cursor: pointer; width: 100%; transition: 0.2s;
+            border-radius: 4px;
+        }
+        button:hover { background: #0066cc; }
+        button:active { transform: scale(0.98); }
+    </style>
+</head>
+<body>
+
+    <div id="overlay">
+        <h2 style="margin-top: 0;">🛰️ FLEET RADAR ONLINE</h2>
+        <p>Awaiting coordinates...</p>
+    </div>
+
+    <div id="control-panel">
+        <h3 style="margin-top: 0; color: #0a84ff;">⚡ TELEPORT (艦隊空降)</h3>
+        LAT: <input type="text" id="input-lat" value="24.145161"><br>
+        LON: <input type="text" id="input-lon" value="120.670531"><br>
+        <button id="teleport-btn" onclick="executeTeleport()">ENGAGE TELEPORT</button>
+    </div>
+
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script>
+        // 1. 初始化地圖，中心點設在台中
+        var map = L.map('map').setView([24.145161, 120.670531], 15);
+
+        // 2. 載入暗色系科技風底圖
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            attribution: '© OpenStreetMap contributors, © CARTO',
+            maxZoom: 19
+        }).addTo(map);
+
+        // 儲存艦隊標記的字典
+        var fleetMarkers = {};
+        // 建立一個彈出式視窗，用來顯示右鍵點擊的標記
+        var targetPopup = L.popup();
+
+        // 3. 建立 WebSocket 連線接上 Python 後端
+        var ws = new WebSocket("ws://localhost:8000/ws");
+
+        ws.onopen = function() {
+            document.querySelector('#overlay p').innerText = "連線成功！雷達掃描中...";
+            document.querySelector('#overlay p').style.color = "#32d74b";
+        };
+
+        ws.onmessage = function(event) {
+            var data = JSON.parse(event.data);
+            
+            // 原本的雷達更新訊號
+            if (data.type === "radar_update") {
+                for (var shipName in data.fleet) {
+                    var coords = data.fleet[shipName];
+                    if (!fleetMarkers[shipName]) {
+                        var marker = L.marker([coords.lat, coords.lon]).addTo(map);
+                        marker.bindPopup(`<b>${shipName}</b><br>LAT: ${coords.lat}<br>LON: ${coords.lon}`);
+                        fleetMarkers[shipName] = marker;
+                    } else {
+                        fleetMarkers[shipName].setLatLng([coords.lat, coords.lon]);
+                    }
+                }
+            } 
+            // --- [新增這一段] 接收到鏡頭跳躍訊號 ---
+            else if (data.type === "map_center") {
+                // 使用 Leaflet 的 flyTo 產生平滑的飛行追蹤效果
+                map.flyTo([data.lat, data.lon], 16, {
+                    animate: true,
+                    duration: 1.5 // 動畫持續 1.5 秒
+                });
+            }
+        };
+
+        // 4. 執行空降指令：傳送 WebSocket 訊號給 Python 後端
+        function executeTeleport() {
+            var lat = document.getElementById('input-lat').value;
+            var lon = document.getElementById('input-lon').value;
+            
+            var payload = {
+                action: "teleport",
+                lat: parseFloat(lat),
+                lon: parseFloat(lon)
+            };
+            
+            ws.send(JSON.stringify(payload));
+            
+            // 點擊後按鈕稍微閃爍一下給予回饋
+            var btn = document.getElementById('teleport-btn');
+            var originalColor = btn.style.backgroundColor;
+            btn.style.backgroundColor = "#32d74b"; // 變成綠色
+            btn.innerText = "COORDINATES SENT!";
+            setTimeout(() => {
+                btn.style.backgroundColor = originalColor;
+                btn.innerText = "ENGAGE TELEPORT";
+            }, 1000);
+        }
+
+        // 5. 【修復與強化】右鍵鎖定座標功能
+        map.on('contextmenu', function(e) {
+            // 自動填入左下角輸入框
+            document.getElementById('input-lat').value = e.latlng.lat.toFixed(6);
+            document.getElementById('input-lon').value = e.latlng.lng.toFixed(6);
+            
+            // 在地圖上顯示「鎖定」視覺回饋
+            targetPopup
+                .setLatLng(e.latlng)
+                .setContent(`<span style="color:#ff453a; font-weight:bold;">🎯 鎖定空降點</span><br>${e.latlng.lat.toFixed(6)}, ${e.latlng.lng.toFixed(6)}`)
+                .openOn(map);
+        });
+
+        // ==========================================
+        // 6. 載入靜態戰略物資點 (Wayfarer POIs)
+        // ==========================================
+        fetch('/api/pois')
+            .then(response => response.json())
+            .then(data => {
+                if (data.pois && data.pois.length > 0) {
+                    data.pois.forEach(poi => {
+                        // 使用琥珀色發光圓點表示潛在的大花/蘑菇
+                        L.circleMarker([poi.lat, poi.lon], {
+                            radius: 5,
+                            fillColor: "#ffaa00", // 琥珀色
+                            color: "#ffffff",     // 白色邊框
+                            weight: 1,
+                            opacity: 1,
+                            fillOpacity: 0.8
+                        }).addTo(map).bindPopup(
+                            `<b style="color:#ffaa00;">🍄 ${poi.name}</b><br>` + 
+                            `LAT: ${poi.lat.toFixed(6)}<br>` + 
+                            `LON: ${poi.lon.toFixed(6)}`
+                        );
+                    });
+                    
+                    // 在左上角的狀態面板顯示載入數量
+                    var overlay = document.querySelector('#overlay');
+                    var poiStatus = document.createElement('p');
+                    poiStatus.style.color = "#ffaa00";
+                    poiStatus.innerText = `[情報] 已載入 ${data.pois.length} 個戰略點位`;
+                    overlay.appendChild(poiStatus);
+                }
+            })
+            .catch(err => console.error("無法載入戰略點位:", err));
+    </script>
+</body>
+</html>

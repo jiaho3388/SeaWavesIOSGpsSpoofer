@@ -7,12 +7,92 @@ import json
 import re
 import threading
 import math
+import os
 import urllib.request
 import tkinter as tk
 from tkinter import messagebox, font, ttk, filedialog
+# --- 請加在原本的 import 下方 ---
+from fastapi import FastAPI, WebSocket
+from fastapi.responses import HTMLResponse
+import uvicorn
+import asyncio
+from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO)
 
+# ==============================================================================
+# ========================= [Web 全息雷達通訊塔] ===============================
+# ==============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/")
+async def get_dashboard():
+    # 讀取前端網頁
+    with open("index.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
+    
+@app.get("/api/pois")
+async def get_pois():
+    """讀取靜態戰略物資點 (Wayfarer POIs) 並派發給前端雷達"""
+    if os.path.exists("pois.json"):
+        with open("pois.json", "r", encoding="utf-8") as f:
+            return json.loads(f.read())
+    return {"pois": []}
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    logging.info("🌐 前端全息地圖已連線！")
+    
+    async def send_radar():
+        global force_map_center # <--- 宣告 global
+        while True:
+            try:
+                # --- [新增這一段] 處理鏡頭跳躍請求 ---
+                if force_map_center:
+                    await websocket.send_text(json.dumps({
+                        "type": "map_center", 
+                        "lat": force_map_center["lat"], 
+                        "lon": force_map_center["lon"]
+                    }))
+                    force_map_center = None # 發送完就清除信號
+                # ------------------------------------
+                
+                # 將原版的 device_coords (lat, lon) 轉換給網頁
+                fleet_data = {}
+                for udid, coords in device_coords.items():
+                    name = next((d['name'] for d in connected_devices if d['udid'] == udid), "Unknown Ship")
+                    fleet_data[name] = {"lat": coords[0], "lon": coords[1]}
+                
+                await websocket.send_text(json.dumps({"type": "radar_update", "fleet": fleet_data}))
+                await asyncio.sleep(0.3)
+            except Exception: break
+
+    async def receive_commands():
+        while True:
+            try:
+                cmd = json.loads(await websocket.receive_text())
+                if cmd.get("action") == "teleport":
+                    target_lat, target_lon = float(cmd["lat"]), float(cmd["lon"])
+                    # 呼叫你原本寫好的 set_device_location 函數！
+                    for u in connected_devices:
+                        udid = u["udid"]
+                        set_device_location(udid, target_lat, target_lon)
+                        device_coords[udid] = (target_lat, target_lon)
+            except Exception: break
+
+    await asyncio.gather(asyncio.create_task(send_radar()), asyncio.create_task(receive_commands()))
+
+def run_fastapi():
+    # 背景啟動伺服器，不阻擋 Tkinter
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
+    server = uvicorn.Server(config)
+    server.run()
+# ==============================================================================
 # ==============================================================================
 # ========================= [全域變數宣告] =================================
 # ==============================================================================
@@ -48,6 +128,7 @@ is_routing = False
 sync_var = None
 engines = {}       # 格式: { "UDID": ContinuousLocationEngine_Instance }
 device_coords = {} # 格式: { "UDID": (lat, lon) }
+force_map_center = None  # 用來觸發地圖視角跳躍的信號
 
 # 動態雷達 UI 儲存庫
 radar_labels = {}  # 格式: { "UDID": {"frame": tk.Frame, "name": tk.Label, "coords": tk.Label} }
@@ -230,6 +311,10 @@ def monitor_device_connection():
             if clean_output.strip(): 
                 devices_json = json.loads(clean_output)
                 connected_devices = [{"name": f"{d.get('DeviceName', 'Unknown')} ({d.get('Identifier','')[:8]}...)", "udid": d.get("Identifier", ""), "version": d.get("ProductVersion", "16.0")} for d in devices_json if d.get("Identifier")]
+                # --- 在它下面補上這三行，賦予台中初始座標 ---
+                for d in connected_devices:
+                    if d["udid"] not in device_coords:
+                        device_coords[d["udid"]] = (24.145161, 120.670531)
                 device_connected = len(connected_devices) > 0
             else:
                 connected_devices = []
@@ -349,6 +434,9 @@ def set_location():
             set_device_location(u, latitude, longitude)
             device_coords[u] = (latitude, longitude) # 更新該設備的獨立記憶體
             
+        global force_map_center
+        force_map_center = {"lat": latitude, "lon": longitude}
+        
     except ValueError: messagebox.showerror("Error", "請輸入有效數字。")
 
 # ==============================================================================
@@ -369,6 +457,8 @@ def main():
 
     start_tunneld_engine()
     threading.Thread(target=monitor_device_connection, daemon=True).start()
+
+    threading.Thread(target=run_fastapi, daemon=True).start()
 
     root = tk.Tk()
     root.title("Rei's iOS Location Simulator Pro v2.4.1 (Command Center)")
